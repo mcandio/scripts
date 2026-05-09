@@ -1,0 +1,74 @@
+name: Supabase Keep-Alive
+
+# Supabase free-tier projects auto-pause after 7 days of inactivity.
+# This workflow pings the project every 3 days via a public-readable table read,
+# resetting the inactivity timer. No data is read beyond a single row id.
+#
+# Required GitHub Action secrets (Settings → Secrets and variables → Actions):
+#   SUPABASE_URL       — e.g. https://<project-ref>.supabase.co
+#   SUPABASE_ANON_KEY  — public anon key (NOT the service role key)
+#
+# Optional repository variables (Settings → Secrets and variables → Actions → Variables):
+#   SUPABASE_TABLE  — table name to query; defaults to 'comments'.
+#                     The table must have an anon SELECT RLS policy.
+
+on:
+  schedule:
+    # Every 3 days at 09:00 UTC (well inside the 7-day pause threshold)
+    - cron: "0 9 */3 * *"
+  workflow_dispatch: {}
+
+# Lock down default GITHUB_TOKEN — this workflow doesn't need any repo permissions
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    name: Ping Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping public-readable table
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_TABLE: ${{ vars.SUPABASE_TABLE || 'comments' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+            echo "::error::SUPABASE_URL or SUPABASE_ANON_KEY secret is missing"
+            exit 1
+          fi
+
+          # Strip any trailing slash on the URL
+          SUPABASE_URL="${SUPABASE_URL%/}"
+
+          endpoint="${SUPABASE_URL}/rest/v1/${SUPABASE_TABLE}?select=id&limit=1"
+
+          # %{http_code} prints the response status; -o /dev/null discards body
+          # We only care that the project responded; we do not log the response.
+          status=$(curl --silent --show-error --fail-with-body \
+            --max-time 30 \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --header "apikey: ${SUPABASE_ANON_KEY}" \
+            --header "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            --header "Accept: application/json" \
+            "${endpoint}" || echo "FAIL")
+
+          if [ "$status" = "FAIL" ]; then
+            echo "::error::curl failed to reach Supabase (network error or non-2xx response)"
+            exit 1
+          fi
+
+          if [ "$status" != "200" ] && [ "$status" != "206" ]; then
+            echo "::error::Supabase returned HTTP $status (expected 200 or 206)"
+            exit 1
+          fi
+
+          echo "Supabase project '${SUPABASE_URL}' pinged successfully (HTTP $status, table=${SUPABASE_TABLE})"
